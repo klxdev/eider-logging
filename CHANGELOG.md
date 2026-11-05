@@ -3,7 +3,7 @@
 eider-logging's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.0
 
 First release, for Eider 0.7 (`eider = "0.7"`): `std/log` of Eider 0.7.2 moved out of std (eider-lang #216).
 

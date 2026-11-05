@@ -1,0 +1,5 @@
+[package]
+name = "logging"
+version = "0.7.0"
+eider = "0.7"
+description = "Structured logging as JSON lines: levels, typed fields, loggers with base fields and context, and a capturing sink for tests"

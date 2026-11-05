@@ -1,0 +1,349 @@
+//! logging: structured logging as JSON lines, in the style of Go's slog (it was `std/log` up to
+//! Eider 0.7.2). One line per record:
+//!
+//!     {"time":"2026-11-01T12:34:56.789Z","level":"info","msg":"listening","addr":":8080"}
+//!
+//! A `Logger` has a minimum level and fields every record carries (`with`); each call adds its
+//! own. Values are typed by the constructors `text`, `int`, `uint`, `flag` and `error`, so the
+//! JSON has strings, numbers and booleans. Records go to stderr (the default) or stdout; the
+//! whole line is one write, so lines from different threads don't mix.
+//!
+//!     import logging
+//!
+//!     let lg = logging.new(logging.Info).with(logging.fields().text("service", String.from("kv")))
+//!     lg.info("listening", logging.fields().text("addr", addr).int("workers", 4))
+//!
+//! `format` builds a line without touching the clock or a file: tests use it, and so does
+//! anything that wants the line itself.
+//!
+//! Levels are Debug, Info, Warn and Error, and `Off`, above them all: a logger whose minimum is
+//! `Off` writes nothing (`logging.off()`), and no record is ever written at `Off`.
+//!
+//! Tests that look at what was logged use a memory sink: `let mem = logging.memory()`, a logger
+//! `logging.to_memory(logging.Debug, mem)`, and afterwards `mem.records()` (level, message and
+//! fields of each record) or `mem.lines()` (the JSON lines, with the time zeroed so they are the
+//! same on every run). Loggers made from one another (`with`, `at`, `with_context`) share the
+//! sink.
+//!
+//! Context. `Logger.with_context(f)` adds a function that supplies fields for every record the
+//! logger writes (called once per record that is enabled, after the logger's own fields and
+//! before the call's). A tracer uses it to put the current trace and span ids on each record:
+//! `lg.with_context(|| tr.ids_of_current_span())` (eider-http's trace, eider-lang #215).
+//! Several contexts run in the order they were added.
+
+import std.io
+import std.time
+import std.bytes
+
+pub type Level = | Debug | Info | Warn | Error | Off
+
+fn rank(l: Level) -> i32 {
+    match l {
+        Debug => 0
+        Info => 1
+        Warn => 2
+        Error => 3
+        Off => 4
+    }
+}
+
+/// "debug", "info", "warn", "error" or "off".
+pub fn level_name(l: Level) -> str {
+    match l {
+        Debug => "debug"
+        Info => "info"
+        Warn => "warn"
+        Error => "error"
+        Off => "off"
+    }
+}
+
+/// The level named by `s` (as `level_name` gives it; ASCII letters of any case), if there is one.
+pub fn parse_level(s: String) -> Option[Level] {
+    let mut t: List[u8] = List.new()
+    for b in s.bytes() {
+        if b >= 65 && b <= 90 { t.push(b + 32) } else { t.push(b) }
+    }
+    if bytes.eq(t, lit("debug")) { return Some(Debug) }
+    if bytes.eq(t, lit("info")) { return Some(Info) }
+    if bytes.eq(t, lit("warn")) || bytes.eq(t, lit("warning")) { return Some(Warn) }
+    if bytes.eq(t, lit("error")) { return Some(Error) }
+    if bytes.eq(t, lit("off")) { return Some(Off) }
+    None
+}
+
+/// A key and its value already written as JSON.
+pub type Field = { key: String, json: List[u8] }
+
+fn lit(s: str) -> List[u8] { String.from(s).bytes() }
+
+fn hex(n: u8) -> u8 {
+    if n < 10 { return 48 + n }
+    87 + n
+}
+
+/// `s` as a JSON string, quotes included.
+pub fn quote(s: List[u8]) -> List[u8] {
+    let mut o: List[u8] = List.new()
+    o.push(34)
+    for b in s {
+        if b == 34 || b == 92 {
+            o.push(92)
+            o.push(b)
+        } else if b == 10 {
+            bytes.append(inout o, lit("\\n"))
+        } else if b == 13 {
+            bytes.append(inout o, lit("\\r"))
+        } else if b == 9 {
+            bytes.append(inout o, lit("\\t"))
+        } else if b < 32 {
+            bytes.append(inout o, lit("\\u00"))
+            o.push(hex(b / 16))
+            o.push(hex(b % 16))
+        } else {
+            o.push(b)
+        }
+    }
+    o.push(34)
+    o
+}
+
+/// A text value: `"key":"value"`.
+pub fn text(key: str, value: String) -> Field { Field(String.from(key), quote(value.bytes())) }
+
+/// A signed integer value.
+pub fn int(key: str, value: i64) -> Field { Field(String.from(key), String.from_int(value).bytes()) }
+
+/// An unsigned integer value.
+pub fn uint(key: str, value: u64) -> Field { Field(String.from(key), bytes.from_u64(value)) }
+
+/// A boolean value.
+pub fn flag(key: str, value: bool) -> Field {
+    if value { return Field(String.from(key), lit("true")) }
+    Field(String.from(key), lit("false"))
+}
+
+/// Fields for a record, built one after another: `log.fields().text("addr", a).int("n", 4)`.
+pub type Fields = { list: List[Field] }
+
+/// No fields.
+pub fn fields() -> Fields { Fields(List.new()) }
+
+impl Fields {
+    fn add(self, f: Field) -> Fields {
+        let mut l = self.list.copy()
+        l.push(f)
+        Fields(l)
+    }
+    fn text(self, key: str, value: String) -> Fields { self.add(text(key, value)) }
+    fn int(self, key: str, value: i64) -> Fields { self.add(int(key, value)) }
+    fn uint(self, key: str, value: u64) -> Fields { self.add(uint(key, value)) }
+    fn flag(self, key: str, value: bool) -> Fields { self.add(flag(key, value)) }
+    fn error(self, message: String) -> Fields { self.add(error(message)) }
+}
+
+/// An error value: the field `error` with the message.
+pub fn error(message: String) -> Field { Field(String.from("error"), quote(message.bytes())) }
+
+fn pad(inout o: List[u8], n: i64, width: i64) {
+    let mut digits = bytes.from_u64(n as u64)
+    while digits.len() < (width as usize) {
+        let mut z = lit("0")
+        bytes.append(inout z, digits)
+        digits = z
+    }
+    bytes.append(inout o, digits)
+}
+
+/// Milliseconds since the Unix epoch as "2026-11-01T12:34:56.789Z" (UTC).
+pub fn rfc3339(ms: i64) -> List[u8] {
+    let mut days = ms / 86400000
+    let mut rem = ms % 86400000
+    if rem < 0 {
+        rem += 86400000
+        days -= 1
+    }
+    // civil date from days since 1970-01-01 (Howard Hinnant's algorithm)
+    let z = days + 719468
+    let zq = if z >= 0 { z } else { z - 146096 }
+    let era = zq / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let mut y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    if m <= 2 { y += 1 }
+    let mut o: List[u8] = List.new()
+    pad(inout o, y, 4)
+    o.push(45)
+    pad(inout o, m, 2)
+    o.push(45)
+    pad(inout o, d, 2)
+    o.push(84)
+    pad(inout o, rem / 3600000, 2)
+    o.push(58)
+    pad(inout o, rem / 60000 % 60, 2)
+    o.push(58)
+    pad(inout o, rem / 1000 % 60, 2)
+    o.push(46)
+    pad(inout o, rem % 1000, 3)
+    o.push(90)
+    o
+}
+
+/// One record as a memory sink keeps it: the time, level and message, and its fields (the
+/// logger's own, its context's, then the call's).
+pub type Record = { time_ms: i64, level: Level, msg: String, fields: Fields }
+
+impl Record {
+    /// The JSON text of the field `key` (`"abc"` with its quotes, `4`, `true`), if the record has it
+    /// (the last one, if it has several).
+    fn field(self, key: str) -> Option[String] {
+        let mut found: Option[String] = None
+        for f in self.fields.list {
+            if f.key == String.from(key) {
+                found = Some(String.from_bytes(f.json.copy()).unwrap_or(String.from("")))
+            }
+        }
+        found
+    }
+
+    /// The record as a JSON line, as `format` writes it.
+    fn line(self) -> List[u8] { format(self.time_ms, self.level, self.msg.copy(), fields(), self.fields.copy()) }
+}
+
+/// The records written to a memory sink, in order. Copies share the records.
+pub type Memory = { st: Mutex[List[Record]] }
+
+/// An empty memory sink: `to_memory(min, mem)` makes a logger that writes to it.
+pub fn memory() -> Memory { Memory(Mutex.new(List.new())) }
+
+impl Memory {
+    fn add(self, r: Record) {
+        self.st.update(|l: List[Record]| -> List[Record] {
+            let mut n = l.copy()
+            n.push(r.copy())
+            n
+        })
+    }
+
+    /// The records written so far.
+    fn records(self) -> List[Record] { self.st.get() }
+
+    /// How many records were written.
+    fn len(self) -> usize { self.st.get().len() }
+
+    /// The records as JSON lines (no trailing newline), with the time of every one 1970-01-01T00:00:00.000Z, so
+    /// that they do not depend on the clock.
+    fn lines(self) -> List[String] {
+        let mut out: List[String] = List.new()
+        for r in self.st.get() {
+            out.push(String.from_bytes(format(0, r.level, r.msg.copy(), fields(), r.fields.copy())).unwrap_or(String.from("")))
+        }
+        out
+    }
+
+    /// Forgets the records.
+    fn clear(self) { self.st.set(List.new()) }
+}
+
+pub type Dest = | Stderr | Stdout | Mem(sink: Memory)
+
+pub type Logger = { min: Level, base: Fields, dest: Dest, ctx: List[fn() -> Fields] }
+
+/// A logger writing records at `min` or above to stderr.
+pub fn new(min: Level) -> Logger { Logger(min, fields(), Stderr, List.new()) }
+
+/// A logger writing records at `min` or above to stdout.
+pub fn to_stdout(min: Level) -> Logger { Logger(min, fields(), Stdout, List.new()) }
+
+/// A logger keeping the records at `min` or above in `mem` instead of writing them (for tests).
+pub fn to_memory(min: Level, mem: Memory) -> Logger { Logger(min, fields(), Mem(mem), List.new()) }
+
+/// A logger that writes nothing (the minimum level `Off`).
+pub fn off() -> Logger { new(Off) }
+
+/// One record as a line (no trailing newline): time, level, msg, the logger's fields, then
+/// `fields`. A field named time, level or msg would repeat a key; don't.
+pub fn format(time_ms: i64, level: Level, msg: String, base: Fields, more: Fields) -> List[u8] {
+    let mut o = lit("\x7b\"time\":")
+    bytes.append(inout o, quote(rfc3339(time_ms)))
+    bytes.append(inout o, lit(",\"level\":\""))
+    bytes.append(inout o, lit(level_name(level)))
+    bytes.append(inout o, lit("\",\"msg\":"))
+    bytes.append(inout o, quote(msg.bytes()))
+    for f in base.list {
+        o.push(44)
+        bytes.append(inout o, quote(f.key.bytes()))
+        o.push(58)
+        bytes.append(inout o, f.json.copy())
+    }
+    for f in more.list {
+        o.push(44)
+        bytes.append(inout o, quote(f.key.bytes()))
+        o.push(58)
+        bytes.append(inout o, f.json.copy())
+    }
+    o.push(125)
+    o
+}
+
+impl Logger {
+    /// A logger with `more` added to the fields every record carries.
+    fn with(self, more: Fields) -> Logger {
+        let mut b = self.base.list.copy()
+        for f in more.list { b.push(f) }
+        Logger(self.min, Fields(b), self.dest, self.ctx.copy())
+    }
+
+    /// A logger with another minimum level.
+    fn at(self, min: Level) -> Logger { Logger(min, self.base, self.dest, self.ctx.copy()) }
+
+    /// A logger that also calls `f` for every record it writes and adds the fields `f` returns
+    /// (after the logger's own fields, before the call's): the hook for ids that change from
+    /// record to record, like the trace and span of the running request.
+    fn with_context(self, f: fn() -> Fields) -> Logger {
+        let mut c = self.ctx.copy()
+        c.push(f)
+        Logger(self.min, self.base, self.dest, c)
+    }
+
+    /// Whether a record at `level` is written: never at `Off`, and never when the minimum is `Off`.
+    fn enabled(self, level: Level) -> bool {
+        match level {
+            Off => false
+            _ => rank(level) >= rank(self.min)
+        }
+    }
+
+    /// The fields every record carries now: the logger's own, then what its contexts supply.
+    fn carried(self) -> Fields {
+        let mut b = self.base.list.copy()
+        for f in self.ctx {
+            for x in f().list { b.push(x) }
+        }
+        Fields(b)
+    }
+
+    /// Writes a record at `level` (if enabled) with the wall clock's time.
+    fn log(self, level: Level, msg: str, more: Fields) uses io, clock {
+        if !self.enabled(level) { return }
+        let now = time.wall_ns() / 1000000
+        match self.dest {
+            Stderr => io.errln(format(now, level, String.from(msg), self.carried(), more))
+            Stdout => io.outln(format(now, level, String.from(msg), self.carried(), more))
+            Mem(m) => {
+                let mut all = self.carried().list.copy()
+                for f in more.list { all.push(f) }
+                m.add(Record(now, level, String.from(msg), Fields(all)))
+            }
+        }
+    }
+
+    fn debug(self, msg: str, more: Fields) uses io, clock { self.log(Debug, msg, more) }
+    fn info(self, msg: str, more: Fields) uses io, clock { self.log(Info, msg, more) }
+    fn warn(self, msg: str, more: Fields) uses io, clock { self.log(Warn, msg, more) }
+    fn error(self, msg: str, more: Fields) uses io, clock { self.log(Error, msg, more) }
+}

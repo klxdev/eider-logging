@@ -1,0 +1,60 @@
+// logging: the Off level, the memory sink for tests, and context fields (the hook for trace ids)
+import logging
+import std.io
+
+fn trace_ids() -> logging.Fields {
+    logging.fields().text("trace_id", String.from("abc123")).text("span_id", String.from("s1"))
+}
+
+fn counter() -> logging.Fields { logging.fields().int("n", 7) }
+
+fn show(lines: List[String]) uses io {
+    for l in lines { print(l) }
+}
+
+fn main() uses io, clock {
+    print("-- off")
+    print(logging.level_name(logging.Off))
+    print(logging.parse_level(String.from("OFF")).is_some())
+    print(logging.new(logging.Off).enabled(logging.Error))
+    print(logging.new(logging.Error).enabled(logging.Off))
+    print(logging.new(logging.Debug).enabled(logging.Off))
+    print(logging.off().enabled(logging.Error))
+    // nothing is written to stderr: the run's output is compared exactly
+    logging.off().error("dropped", logging.fields())
+
+    print("-- memory sink, a minimum level")
+    let mem = logging.memory()
+    let lg = logging.to_memory(logging.Info, mem).with(logging.fields().text("service", String.from("kv")))
+    lg.debug("below the minimum", logging.fields())
+    lg.info("listening", logging.fields().text("addr", String.from(":8080")).int("workers", 4))
+    lg.at(logging.Debug).debug("copies share the sink", logging.fields().flag("ok", true))
+    lg.error("failed", logging.fields().error(String.from("boom")))
+    print(mem.len())
+    show(mem.lines())
+    let rs = mem.records()
+    print(logging.level_name(rs[1].level))
+    print(rs[0].msg)
+    print(rs[0].field("addr").unwrap())
+    print(rs[0].field("service").unwrap())
+    print(rs[0].field("nope").is_none())
+    print(rs[0].time_ms > 0)
+    mem.clear()
+    print(mem.len())
+
+    print("-- the minimum Off keeps nothing")
+    let quiet = logging.to_memory(logging.Off, mem)
+    quiet.error("dropped", logging.fields())
+    print(mem.len())
+
+    print("-- context fields come after the logger's, before the call's")
+    let cl = logging.to_memory(logging.Debug, mem).with(logging.fields().text("service", String.from("kv"))).with_context(trace_ids).with_context(counter)
+    cl.info("handled", logging.fields().int("status", 200))
+    show(mem.lines())
+    // the plain logger is unchanged by with_context on a copy
+    let plain = logging.to_memory(logging.Debug, mem)
+    plain.with_context(trace_ids)
+    mem.clear()
+    plain.info("plain", logging.fields())
+    show(mem.lines())
+}

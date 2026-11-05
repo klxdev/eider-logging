@@ -1,0 +1,36 @@
+// logging: the JSON line of a record (quoting, typed fields, the logger's own fields first),
+// levels, parse_level, and the time as RFC 3339.
+
+import logging
+import std.io
+import std.bytes
+
+fn show(b: List[u8]) uses io {
+    print(String.from_bytes(b).unwrap_or(String.from("?")))
+}
+
+fn main() uses io, clock {
+    show(logging.rfc3339(0))
+    show(logging.rfc3339(1793590496789))
+    show(logging.rfc3339(951782400000))
+    show(logging.rfc3339(1709164800000 + 86399999))
+    show(logging.rfc3339(0 - 1))
+    let base = logging.fields().text("service", String.from("kv"))
+    show(logging.format(0, logging.Info, String.from("listening"), base, logging.fields().text("addr", String.from(":8080")).int("workers", 4)))
+    show(logging.format(1000, logging.Error, String.from("say \"hi\"\n\ttab\\ \u{1}"), logging.fields(), logging.fields().flag("retry", true).uint("n", 18446744073709551615).int("neg", 0 - 5).error(String.from("boom"))))
+    show(logging.format(0, logging.Warn, String.from("h\u{e9}llo \u{1F600}"), logging.fields(), logging.fields()))
+    let l = logging.new(logging.Warn)
+    print(l.enabled(logging.Debug))
+    print(l.enabled(logging.Info))
+    print(l.enabled(logging.Warn))
+    print(l.enabled(logging.Error))
+    print(l.at(logging.Debug).enabled(logging.Debug))
+    print(logging.parse_level(String.from("WARN")).is_some())
+    print(logging.parse_level(String.from("Warning")).is_some())
+    print(logging.parse_level(String.from("loud")).is_none())
+    print(logging.level_name(logging.parse_level(String.from("DeBuG")).unwrap()))
+    // to stdout, below the minimum: nothing is written
+    let o = logging.to_stdout(logging.Error)
+    o.info("dropped", logging.fields())
+    print(l.with(logging.fields().int("a", 1)).base.list.len())
+}
